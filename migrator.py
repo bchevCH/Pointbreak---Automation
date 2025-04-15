@@ -10,6 +10,7 @@ import requests
 import re
 import shutil
 import mysql.connector
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from requests.adapters import HTTPAdapter
@@ -23,7 +24,7 @@ from config import (
 )
 from exceptions import (
     ProductNotFoundError, FTPConnectionError,
-    ImageUploadError, APIError, FileSystemError
+    ImageUploadError, APIError, FileSystemError, DatabaseError
 )
 
 # Configuration du logger
@@ -171,12 +172,17 @@ class WordPressHandler:
             consumer_key (str): Clé API WooCommerce
             consumer_secret (str): Secret API WooCommerce
         """
+        if not api_url or not consumer_key or not consumer_secret:
+            logger.error("Configuration API WordPress/WooCommerce incomplète")
+            raise ValueError("Les paramètres d'API WooCommerce sont requis (URL, clé, secret)")
+            
         self.api_url = api_url
         self.wcapi = API(
             url=api_url,
             consumer_key=consumer_key,
             consumer_secret=consumer_secret,
-            version="wc/v3"
+            version="wc/v3",
+            timeout=API_CONFIG["timeout"]
         )
         
         # Configuration des retries pour les requêtes
@@ -184,7 +190,8 @@ class WordPressHandler:
         retry_strategy = Retry(
             total=API_CONFIG["retry_attempts"],
             backoff_factor=API_CONFIG["retry_backoff_factor"],
-            status_forcelist=API_CONFIG["retry_status_forcelist"]
+            status_forcelist=API_CONFIG["retry_status_forcelist"],
+            allowed_methods=["GET", "POST", "PUT", "DELETE"]
         )
         adapter = HTTPAdapter(max_retries=retry_strategy)
         self.session.mount("http://", adapter)
@@ -203,10 +210,14 @@ class WordPressHandler:
         Raises:
             APIError: Si la requête API échoue
         """
+        if not product_name:
+            logger.warning("Nom de produit vide fourni")
+            return None
+            
         try:
             response = self.wcapi.get(
                 "products",
-                params={"search": product_name},
+                params={"search": product_name, "per_page": 20},
                 timeout=API_CONFIG["timeout"]
             )
             
@@ -215,11 +226,16 @@ class WordPressHandler:
                 for product in products:
                     if product['name'].lower() == product_name.lower():
                         return product
+                        
+                logger.warning(f"Produit '{product_name}' non trouvé dans WooCommerce")
+                return None
             else:
                 raise APIError("products", response.status_code, response.text)
-                
-            return None
-        except Exception as error:
+        except requests.exceptions.Timeout:
+            logger.error(f"Timeout lors de la recherche du produit '{product_name}'")
+            raise APIError("products", 0, "Timeout de la requête")
+        except requests.exceptions.RequestException as error:
+            logger.error(f"Erreur lors de la recherche du produit '{product_name}': {error}")
             raise APIError("products", 0, str(error))
 
     def check_image_exists(self, image_name):
@@ -235,12 +251,16 @@ class WordPressHandler:
         Raises:
             APIError: Si la requête API échoue
         """
+        if not image_name:
+            logger.warning("Nom d'image vide fourni")
+            return False
+            
         try:
             response = self.wcapi.get(
                 "media",
                 params={
                     "search": image_name,
-                    "per_page": 1
+                    "per_page": 5
                 },
                 timeout=API_CONFIG["timeout"]
             )
@@ -250,12 +270,16 @@ class WordPressHandler:
                 if media:
                     for item in media:
                         if item['title']['rendered'].lower() == image_name.lower():
+                            logger.info(f"Image trouvée dans la médiathèque: {image_name}")
                             return True
+                return False
             else:
                 raise APIError("media", response.status_code, response.text)
-                
-            return False
-        except Exception as error:
+        except requests.exceptions.Timeout:
+            logger.error(f"Timeout lors de la vérification d'image '{image_name}'")
+            raise APIError("media", 0, "Timeout de la requête")
+        except requests.exceptions.RequestException as error:
+            logger.error(f"Erreur lors de la vérification d'image '{image_name}': {error}")
             raise APIError("media", 0, str(error))
 
     def upload_image(self, image_path, product_id, is_main_image=False):
@@ -268,12 +292,17 @@ class WordPressHandler:
             is_main_image (bool): True si image principale
 
         Returns:
-            bool: True si l'upload réussit, False sinon
+            bool: True si l'upload réussit
 
         Raises:
             ImageUploadError: Si l'upload échoue
             APIError: Si la requête API échoue
+            FileNotFoundError: Si le fichier image n'existe pas
         """
+        if not os.path.exists(image_path):
+            logger.error(f"Fichier non trouvé: {image_path}")
+            raise FileNotFoundError(f"Le fichier image n'existe pas: {image_path}")
+            
         try:
             # Vérification de l'existence de l'image
             image_name = os.path.basename(image_path)
@@ -286,24 +315,33 @@ class WordPressHandler:
                 files = {'file': file}
                 data = {
                     'title': image_name,
+                    'alt_text': image_name.split('.')[0],
                     'post': product_id
                 }
+                
+                logger.info(f"Début de l'upload de {image_name} pour le produit {product_id}")
                 response = self.session.post(
                     f"{self.api_url}/media",
                     auth=(self.wcapi.consumer_key, self.wcapi.consumer_secret),
                     files=files,
                     data=data,
-                    timeout=API_CONFIG["timeout"]
+                    timeout=API_CONFIG["timeout"] * 2  # Timeout plus long pour les uploads
                 )
             
             if response.status_code == 201:
                 image_id = response.json()['id']
+                logger.info(f"Image uploadée avec succès: {image_name} (ID: {image_id})")
                 
                 # Récupération des images actuelles du produit
-                product = self.wcapi.get(
+                product_response = self.wcapi.get(
                     f"products/{product_id}",
                     timeout=API_CONFIG["timeout"]
-                ).json()
+                )
+                
+                if product_response.status_code != 200:
+                    raise APIError(f"products/{product_id}", product_response.status_code, product_response.text)
+                    
+                product = product_response.json()
                 current_images = product.get('images', [])
                 
                 # Préparation des nouvelles images
@@ -314,16 +352,27 @@ class WordPressHandler:
                 
                 # Mise à jour du produit
                 update_data = {"images": new_images}
-                self.wcapi.put(
+                update_response = self.wcapi.put(
                     f"products/{product_id}",
                     update_data,
                     timeout=API_CONFIG["timeout"]
                 )
+                
+                if update_response.status_code not in [200, 201]:
+                    raise APIError(f"products/{product_id}", update_response.status_code, update_response.text)
+                    
                 logger.info(f"Image associée au produit {product_id} (principale: {is_main_image})")
                 return True
             else:
                 raise APIError("media", response.status_code, response.text)
+        except requests.exceptions.Timeout:
+            logger.error(f"Timeout lors de l'upload de l'image '{image_path}'")
+            raise ImageUploadError(image_path, "Timeout de la requête")
+        except requests.exceptions.RequestException as error:
+            logger.error(f"Erreur réseau lors de l'upload de l'image '{image_path}': {error}")
+            raise ImageUploadError(image_path, str(error))
         except Exception as error:
+            logger.error(f"Erreur inattendue lors de l'upload de l'image '{image_path}': {error}")
             raise ImageUploadError(image_path, str(error))
 
     def get_product_stock(self, product_id):
@@ -340,12 +389,21 @@ class WordPressHandler:
             APIError: Si la requête API échoue
         """
         try:
-            product = self.wcapi.get(
+            response = self.wcapi.get(
                 f"products/{product_id}",
                 timeout=API_CONFIG["timeout"]
-            ).json()
+            )
+            
+            if response.status_code != 200:
+                raise APIError(f"products/{product_id}", response.status_code, response.text)
+                
+            product = response.json()
             return product.get('stock_quantity', 0)
-        except Exception as error:
+        except requests.exceptions.Timeout:
+            logger.error(f"Timeout lors de la récupération du stock du produit {product_id}")
+            raise APIError(f"products/{product_id}", 0, "Timeout de la requête")
+        except requests.exceptions.RequestException as error:
+            logger.error(f"Erreur lors de la récupération du stock du produit {product_id}: {error}")
             raise APIError(f"products/{product_id}", 0, str(error))
 
 class ImageMigrator:
@@ -355,15 +413,15 @@ class ImageMigrator:
         """Initialise le migrator avec les configurations nécessaires."""
         load_dotenv()
         self.ftp_handler = FTPHandler(
-            os.getenv('FTP_HOST'),
-            os.getenv('FTP_USER'),
-            os.getenv('FTP_PASS'),
-            os.getenv('FTP_IMG_PATH')
+            FTP_CONFIG["host"],
+            FTP_CONFIG["user"],
+            FTP_CONFIG["password"],
+            FTP_CONFIG["base_path"]
         )
         self.wp_handler = WordPressHandler(
-            os.getenv('WP_API_URL'),
-            os.getenv('WP_API_USER'),
-            os.getenv('WP_API_PASS')
+            API_CONFIG["url"],
+            API_CONFIG["consumer_key"],
+            API_CONFIG["consumer_secret"]
         )
         self.migration_report = {
             'timestamp': datetime.now().isoformat(),
@@ -378,20 +436,57 @@ class ImageMigrator:
         self.products_data = {}
         self.db_connection = None
 
-    def _connect_db(self):
-        """Établit la connexion à la base de données PrestaShop."""
+    @contextmanager
+    def db_cursor(self):
+        """
+        Gestionnaire de contexte pour les curseurs de base de données.
+        
+        Yields:
+            mysql.connector.cursor: Un curseur de base de données
+            
+        Raises:
+            DatabaseError: Si une erreur de base de données se produit
+        """
+        if not self.db_connection or not self.db_connection.is_connected():
+            self._connect_db()
+
+        cursor = None
         try:
+            cursor = self.db_connection.cursor(dictionary=True)
+            yield cursor
+        except mysql.connector.Error as e:
+            logger.error(f"Erreur de base de données: {e}")
+            raise DatabaseError(str(e))
+        finally:
+            if cursor:
+                cursor.close()
+
+    def _connect_db(self):
+        """
+        Établit la connexion à la base de données PrestaShop.
+        
+        Raises:
+            DatabaseError: Si la connexion à la base de données échoue
+        """
+        try:
+            if self.db_connection and self.db_connection.is_connected():
+                return
+
             self.db_connection = mysql.connector.connect(
                 host=DB_CONFIG['host'],
                 port=DB_CONFIG['port'],
                 database=DB_CONFIG['database'],
                 user=DB_CONFIG['user'],
-                password=DB_CONFIG['password']
+                password=DB_CONFIG['password'],
+                connection_timeout=10,
+                autocommit=False,  # Désactiver l'autocommit pour utiliser les transactions
+                use_pure=True,     # Utiliser l'implémentation pure Python pour plus de stabilité
+                charset='utf8mb4'  # Support des caractères spéciaux
             )
             logger.info("Connexion à la base de données PrestaShop établie")
-        except Exception as e:
-            logger.error(f"Erreur de connexion à la base de données: {str(e)}")
-            raise
+        except mysql.connector.Error as e:
+            logger.error(f"Erreur de connexion à la base de données: {e}")
+            raise DatabaseError(f"Erreur de connexion à la base de données: {e}")
 
     def _get_product_name(self, product_id):
         """
@@ -402,34 +497,34 @@ class ImageMigrator:
             
         Returns:
             str: Nom du produit ou None si non trouvé
+            
+        Raises:
+            DatabaseError: Si une erreur de base de données se produit
         """
         try:
-            if not self.db_connection:
-                self._connect_db()
-
-            cursor = self.db_connection.cursor(dictionary=True)
-            
-            # Requête pour récupérer le nom du produit
-            query = f"""
-                SELECT pl.name 
-                FROM {DB_CONFIG['prefix']}product_lang pl
-                WHERE pl.id_product = %s
-                AND pl.id_lang = 1
-                LIMIT 1
-            """
-            
-            cursor.execute(query, (product_id,))
-            result = cursor.fetchone()
-            cursor.close()
-            
-            if result:
-                return result['name']
-            else:
-                logger.warning(f"Produit {product_id} non trouvé dans la base de données")
-                return None
+            with self.db_cursor() as cursor:
+                # Requête pour récupérer le nom du produit
+                query = f"""
+                    SELECT pl.name 
+                    FROM {DB_CONFIG['prefix']}product_lang pl
+                    WHERE pl.id_product = %s
+                    AND pl.id_lang = 1
+                    LIMIT 1
+                """
                 
+                cursor.execute(query, (product_id,))
+                result = cursor.fetchone()
+                
+                if result:
+                    # Nettoyage du nom de produit pour éviter les problèmes de fichiers
+                    clean_name = re.sub(r'[\\/*?:"<>|]', '', result['name'])
+                    return clean_name
+                else:
+                    logger.warning(f"Produit {product_id} non trouvé dans la base de données")
+                    return None
+                    
         except Exception as e:
-            logger.error(f"Erreur lors de la récupération du nom du produit {product_id}: {str(e)}")
+            logger.error(f"Erreur lors de la récupération du nom du produit {product_id}: {e}")
             return None
 
     def _get_product_stock(self, product_id):
@@ -441,54 +536,71 @@ class ImageMigrator:
             
         Returns:
             int: Quantité en stock ou 0 si non trouvé
+            
+        Raises:
+            DatabaseError: Si une erreur de base de données se produit
         """
         try:
-            if not self.db_connection:
-                self._connect_db()
-
-            cursor = self.db_connection.cursor(dictionary=True)
-            
-            # Requête pour récupérer le stock du produit
-            query = f"""
-                SELECT sa.quantity 
-                FROM {DB_CONFIG['prefix']}stock_available sa
-                WHERE sa.id_product = %s
-                AND sa.id_product_attribute = 0
-                LIMIT 1
-            """
-            
-            cursor.execute(query, (product_id,))
-            result = cursor.fetchone()
-            cursor.close()
-            
-            if result:
-                return int(result['quantity'])
-            else:
-                logger.warning(f"Stock non trouvé pour le produit {product_id}")
-                return 0
+            with self.db_cursor() as cursor:
+                # Requête pour récupérer le stock du produit
+                query = f"""
+                    SELECT sa.quantity 
+                    FROM {DB_CONFIG['prefix']}stock_available sa
+                    WHERE sa.id_product = %s
+                    AND sa.id_product_attribute = 0
+                    LIMIT 1
+                """
                 
+                cursor.execute(query, (product_id,))
+                result = cursor.fetchone()
+                
+                if result:
+                    return int(result['quantity'])
+                else:
+                    logger.warning(f"Stock non trouvé pour le produit {product_id}")
+                    return 0
+                    
         except Exception as e:
-            logger.error(f"Erreur lors de la récupération du stock du produit {product_id}: {str(e)}")
+            logger.error(f"Erreur lors de la récupération du stock du produit {product_id}: {e}")
             return 0
+
+    def close_connections(self):
+        """Ferme toutes les connexions ouvertes."""
+        if self.db_connection:
+            try:
+                self.db_connection.close()
+                logger.info("Connexion à la base de données fermée")
+            except Exception as e:
+                logger.error(f"Erreur lors de la fermeture de la connexion à la base de données: {e}")
 
     def __del__(self):
         """Ferme la connexion à la base de données lors de la destruction de l'objet."""
-        if self.db_connection:
-            self.db_connection.close()
-            logger.info("Connexion à la base de données fermée")
+        self.close_connections()
 
     def extract_prestashop_data(self):
-        """Extrait les données des produits depuis PrestaShop."""
+        """
+        Extrait les données des produits depuis PrestaShop.
+        
+        Returns:
+            bool: True si l'extraction a réussi, False sinon
+        """
+        if not FTP_CONFIG.get("host") or not FTP_CONFIG.get("user") or not FTP_CONFIG.get("password"):
+            logger.error("Configuration FTP incomplète")
+            return False
+        
         try:
             with self.ftp_handler as ftp:
                 # Liste des dossiers de produits
                 product_dirs = ftp.connection.nlst()
+                products_processed = 0
+                
                 for product_dir in product_dirs:
                     if re.match(r'^\d+$', product_dir):  # Vérifie si c'est un dossier de produit
                         try:
                             # Récupération du nom du produit
                             product_name = self._get_product_name(product_dir)
                             if not product_name:
+                                logger.warning(f"Nom de produit non trouvé pour l'ID {product_dir}, ignoré")
                                 continue
 
                             # Création du dossier pour le produit
@@ -496,29 +608,47 @@ class ImageMigrator:
                             product_folder.mkdir(parents=True, exist_ok=True)
 
                             # Récupération des images
-                            images = ftp.get_product_images(product_dir)
+                            main_image, additional_images = ftp.get_product_images(product_dir)
+                            all_images = [main_image] if main_image else []
+                            all_images.extend(additional_images if additional_images else [])
+                            
+                            if not all_images:
+                                logger.warning(f"Aucune image trouvée pour le produit {product_name}")
+                                continue
+                                
                             stock = self._get_product_stock(product_dir)
 
                             # Organisation des images
-                            for idx, image in enumerate(images, 1):
-                                local_path = product_folder / f"{product_name}-{idx}.jpg"
-                                ftp.download_image(image, local_path)
+                            downloaded_images = 0
+                            for idx, image in enumerate(all_images, 1):
+                                if image:
+                                    local_path = product_folder / f"{product_name}-{idx}.jpg"
+                                    if ftp.download_image(image, str(local_path)):
+                                        downloaded_images += 1
 
                             # Stockage des données du produit
                             self.products_data[product_name] = {
                                 'id': product_dir,
-                                'images': len(images),
+                                'images': downloaded_images,
                                 'stock': stock,
                                 'folder': str(product_folder)
                             }
 
-                            logger.info(f"Données extraites pour le produit: {product_name}")
+                            logger.info(f"Données extraites pour le produit: {product_name} ({downloaded_images} images)")
+                            products_processed += 1
 
                         except Exception as e:
-                            logger.error(f"Erreur lors de l'extraction du produit {product_dir}: {str(e)}")
+                            logger.error(f"Erreur lors de l'extraction du produit {product_dir}: {e}")
+                            
+                logger.info(f"Extraction terminée: {products_processed} produits traités")
+                return products_processed > 0
 
+        except FTPConnectionError as e:
+            logger.error(f"Erreur de connexion FTP: {e}")
+            return False
         except Exception as e:
-            logger.error(f"Erreur lors de l'extraction des données: {str(e)}")
+            logger.error(f"Erreur lors de l'extraction des données: {e}")
+            return False
 
     def generate_report(self):
         """Génère un rapport JSON des données extraites."""
@@ -557,48 +687,148 @@ class ImageMigrator:
             logger.info("Migration vers WooCommerce annulée")
 
     def migrate_to_woocommerce(self):
-        """Effectue la migration des images vers WooCommerce."""
+        """
+        Effectue la migration des images vers WooCommerce.
+        
+        Returns:
+            bool: True si la migration a réussi, False sinon
+        """
+        if not self.products_data:
+            logger.warning("Aucune donnée à migrer vers WooCommerce")
+            return False
+        
+        total_products = len(self.products_data)
+        success_count = 0
+        failed_count = 0
+        
+        logger.info(f"Début de la migration vers WooCommerce: {total_products} produits")
+        
         for product_name, data in self.products_data.items():
             try:
                 product_folder = Path(data['folder'])
                 images = sorted(product_folder.glob(f"{product_name}-*.jpg"))
                 
+                if not images:
+                    logger.warning(f"Aucune image trouvée pour le produit {product_name}")
+                    continue
+                    
+                images_success = 0
                 for idx, image_path in enumerate(images, 1):
                     is_main = idx == 1
-                    self.wp_handler.upload_image(
-                        str(image_path),
-                        data['id'],
-                        is_main_image=is_main
-                    )
-                    logger.info(f"Image {idx} du produit {product_name} migrée avec succès")
-
+                    try:
+                        if self.wp_handler.upload_image(str(image_path), data['id'], is_main_image=is_main):
+                            images_success += 1
+                            logger.info(f"Image {idx}/{len(images)} du produit {product_name} migrée avec succès")
+                    except Exception as e:
+                        logger.error(f"Échec de l'upload de l'image {idx} pour {product_name}: {e}")
+                
+                if images_success == len(images):
+                    logger.info(f"Produit {product_name}: {images_success}/{len(images)} images migrées avec succès")
+                    success_count += 1
+                elif images_success > 0:
+                    logger.warning(f"Produit {product_name}: {images_success}/{len(images)} images migrées partiellement")
+                    success_count += 1
+                else:
+                    logger.error(f"Produit {product_name}: échec total de la migration des images")
+                    failed_count += 1
+                    
             except Exception as e:
-                logger.error(f"Erreur lors de la migration du produit {product_name}: {str(e)}")
+                logger.error(f"Erreur lors de la migration du produit {product_name}: {e}")
+                failed_count += 1
+        
+        self.migration_report['summary']['successful_migrations'] = success_count
+        self.migration_report['summary']['failed_migrations'] = failed_count
+        
+        logger.info(f"Migration terminée: {success_count} produits réussis, {failed_count} produits échoués")
+        return success_count > 0
 
 def main():
     """Fonction principale d'exécution."""
-    migrator = ImageMigrator()
+    start_time = datetime.now()
+    logger.info(f"Début du processus de migration: {start_time}")
+    
+    # Création des dossiers temporaires s'ils n'existent pas
+    for directory in [LOGS_DIR, TEMP_DIR]:
+        try:
+            directory.mkdir(exist_ok=True, parents=True)
+        except Exception as e:
+            logger.error(f"Erreur lors de la création du dossier {directory}: {e}")
+            print(f"Erreur critique: Impossible de créer le dossier {directory}")
+            return
+    
+    migrator = None
+    success = False
     
     try:
+        migrator = ImageMigrator()
+        
         # Phase 1: Extraction des données PrestaShop
         logger.info("Début de l'extraction des données PrestaShop")
-        migrator.extract_prestashop_data()
+        extraction_success = migrator.extract_prestashop_data()
+        
+        if not extraction_success:
+            logger.error("L'extraction des données a échoué ou n'a trouvé aucun produit")
+            print("\nAucun produit n'a pu être extrait. Vérifiez les logs pour plus de détails.")
+            return
         
         # Phase 2: Génération du rapport
         logger.info("Génération du rapport d'extraction")
         report_path = migrator.generate_report()
         print(f"\nRapport d'extraction généré: {report_path}")
+        print(f"\nNombre de produits extraits: {len(migrator.products_data)}")
+        print(f"Nombre total d'images: {sum(p['images'] for p in migrator.products_data.values())}")
         
         # Phase 3: Proposition de migration WooCommerce
-        migrator.propose_woocommerce_upload()
+        print("\n=== Proposition de migration vers WooCommerce ===")
+        print("Voulez-vous procéder à la migration vers WooCommerce? (y/n)")
         
+        response = input().lower()
+        if response == 'y':
+            logger.info("Début de la migration vers WooCommerce")
+            migration_success = migrator.migrate_to_woocommerce()
+            
+            if migration_success:
+                print("\nMigration terminée avec succès!")
+                print(f"Produits migrés: {migrator.migration_report['summary']['successful_migrations']}")
+                print(f"Produits échoués: {migrator.migration_report['summary']['failed_migrations']}")
+                success = True
+            else:
+                print("\nLa migration a échoué. Consultez les logs pour plus de détails.")
+        else:
+            logger.info("Migration vers WooCommerce annulée par l'utilisateur")
+            print("\nMigration annulée.")
+            success = True  # L'annulation est considérée comme un succès du programme
+        
+    except KeyboardInterrupt:
+        logger.warning("Interruption utilisateur détectée")
+        print("\nOpération interrompue par l'utilisateur.")
     except Exception as e:
-        logger.error(f"Erreur lors de l'exécution: {str(e)}")
+        logger.error(f"Erreur critique lors de l'exécution: {e}", exc_info=True)
+        print(f"\nUne erreur critique est survenue: {e}")
     finally:
+        # Nettoyage et fermeture des ressources
+        if migrator:
+            try:
+                migrator.close_connections()
+            except Exception as e:
+                logger.error(f"Erreur lors de la fermeture des connexions: {e}")
+                
         # Nettoyage des fichiers temporaires
         if TEMP_DIR.exists():
-            shutil.rmtree(TEMP_DIR)
-            logger.info("Nettoyage des fichiers temporaires effectué")
+            try:
+                shutil.rmtree(TEMP_DIR)
+                logger.info("Nettoyage des fichiers temporaires effectué")
+            except Exception as e:
+                logger.error(f"Erreur lors du nettoyage des fichiers temporaires: {e}")
+        
+        end_time = datetime.now()
+        duration = end_time - start_time
+        logger.info(f"Fin du processus de migration: {end_time} (durée: {duration})")
+        
+        if success:
+            print(f"\nOpération terminée en {duration}")
+        else:
+            print("\nOpération terminée avec des erreurs. Consultez les logs pour plus de détails.")
 
 if __name__ == "__main__":
     main() 

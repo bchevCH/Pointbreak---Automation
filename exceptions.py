@@ -40,4 +40,10 @@ class FileSystemError(MigrationError):
         self.operation = operation
         self.path = path
         self.error = error
-        super().__init__(f"Erreur {operation} sur {path}: {error}") 
+        super().__init__(f"Erreur {operation} sur {path}: {error}")
+
+class DatabaseError(MigrationError):
+    """Exception levée lors d'une erreur de base de données."""
+    def __init__(self, error):
+        self.error = error
+        super().__init__(f"Erreur de base de données: {error}") 

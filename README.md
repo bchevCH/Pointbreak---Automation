@@ -9,27 +9,32 @@ Ce script permet la migration automatisée des images de produits d'un site Pres
 - Renommage automatique des images selon le format `nom-produit-numero.jpg`
 - Génération de rapports détaillés au format JSON
 - Migration contrôlée vers WooCommerce
-- Gestion des erreurs et logging complet
+- Gestion avancée des erreurs avec types d'exceptions dédiées
+- Transactions de base de données sécurisées
+- Gestion des timeouts et retries pour les requêtes réseau
+- Nettoyage automatique des ressources
 
 ## Processus de Migration
 
 Le script exécute la migration en trois phases distinctes :
 
 1. **Extraction des données PrestaShop**
-   - Connexion à la base de données PrestaShop
-   - Récupération des noms de produits et stocks
+   - Connexion sécurisée à la base de données PrestaShop
+   - Récupération des noms de produits et stocks avec validation
    - Création de dossiers par produit
-   - Téléchargement et organisation des images
+   - Téléchargement et organisation des images avec vérification d'intégrité
 
 2. **Génération du rapport**
    - Création d'un rapport JSON détaillé
    - Statistiques globales (nombre de produits, images, stock total)
    - Détails par produit (nom, nombre d'images, stock)
+   - Analyse des succès et échecs
 
 3. **Migration vers WooCommerce**
    - Proposition de migration après vérification des données
-   - Upload contrôlé des images
+   - Upload contrôlé des images avec gestion des retries
    - Association des images aux produits WooCommerce
+   - Détection des images déjà existantes
 
 ## Prérequis
 
@@ -83,13 +88,13 @@ DB_PREFIX=ps_
 
 ```
 .
-├── config.py          # Configuration globale
-├── exceptions.py      # Gestion des exceptions
+├── config.py          # Configuration globale et chargement des variables d'environnement
+├── exceptions.py      # Gestion des exceptions personnalisées
 ├── migrator.py        # Script principal
 ├── requirements.txt   # Dépendances
-├── .env              # Variables d'environnement
-├── logs/             # Dossiers de logs
-└── temp_images/      # Images temporaires
+├── .env               # Variables d'environnement
+├── logs/              # Dossiers de logs et rapports
+└── temp_images/       # Images temporaires (nettoyé automatiquement)
 ```
 
 ## Utilisation
@@ -110,8 +115,8 @@ python migrator.py
 ## Rapports
 
 Les rapports sont générés dans le dossier `logs/` avec :
-- Un fichier de log par exécution
-- Un rapport JSON détaillé contenant :
+- Un fichier de log détaillé par exécution
+- Un rapport JSON contenant :
   ```json
   {
     "timestamp": "2024-04-14T12:00:00",
@@ -126,31 +131,54 @@ Les rapports sont générés dans le dossier `logs/` avec :
     "summary": {
       "total_products": 50,
       "total_images": 150,
-      "total_stock": 500
+      "total_stock": 500,
+      "successful_migrations": 48,
+      "failed_migrations": 2
     }
   }
   ```
 
 ## Gestion des Erreurs
 
-Le script gère plusieurs types d'erreurs :
-- Connexion à la base de données
-- Connexion FTP
-- Téléchargement d'images
-- Upload vers WooCommerce
-- Système de fichiers
+Le script utilise un système avancé de gestion d'erreurs avec:
 
-Chaque erreur est :
-- Loggée dans le fichier de log
-- Incluse dans le rapport final
-- Gérée de manière appropriée pour permettre la continuation du processus
+- **Types d'exceptions personnalisées**:
+  - `DatabaseError`: Problèmes de connexion à la base de données
+  - `FTPConnectionError`: Erreurs de connexion FTP
+  - `ImageUploadError`: Échecs d'upload d'images
+  - `APIError`: Erreurs d'API WooCommerce
+  - `FileSystemError`: Problèmes liés au système de fichiers
+  - `ProductNotFoundError`: Produits non trouvés
+
+- **Mécanismes de récupération**:
+  - Retries automatiques pour les requêtes API
+  - Gestion des timeouts avec paramètres configurables
+  - Continuité d'exécution en cas d'échec partiel
+  - Utilisation de gestionnaires de contexte pour garantir la libération des ressources
+
+- **Logging complet**:
+  - Enregistrement détaillé de toutes les actions
+  - Niveaux de log configurables
+  - Horodatage précis des événements
+  - Détails des erreurs pour faciliter le débogage
 
 ## Sécurité
 
-- Les informations sensibles sont stockées dans `.env`
-- Les connexions sont sécurisées (FTP, API, Base de données)
-- Les fichiers temporaires sont automatiquement supprimés
-- Les mots de passe ne sont jamais affichés dans les logs
+- **Protection des données sensibles**:
+  - Variables d'environnement stockées de manière sécurisée dans `.env`
+  - Aucun identifiant en dur dans le code
+  - Paramètres de connexion chargés à l'exécution
+
+- **Sécurité des connexions**:
+  - Validations des données avant insertion
+  - Protection contre les injections SQL (paramètres préparés)
+  - Transactions de base de données pour garantir l'intégrité
+  - Nettoyage des noms de fichiers pour éviter les injections de chemin
+
+- **Isolation des ressources**:
+  - Fichiers temporaires automatiquement supprimés
+  - Fermeture appropriée de toutes les connexions
+  - Gestion correcte des transactions
 
 ## Contribuer
 
